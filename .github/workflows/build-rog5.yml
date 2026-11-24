@@ -45,8 +45,9 @@ jobs:
           KCFLAGS: -D__ANDROID_COMMON_KERNEL__
         run: |
           export PATH="/usr/lib/llvm-14/bin:$PATH"
+export LOCALVERSION=-qgki-perf
           make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 \
-            CROSS_COMPILE=aarch64-linux-gnu- DISABLE_WRAPPER=1 vendor/anakin_defconfig
+            CROSS_COMPILE=aarch64-linux-gnu- DISABLE_WRAPPER=1 LOCALVERSION=-qgki-perf vendor/anakin_defconfig
           ./scripts/config --file out/.config \
             -e SYSVIPC             -e SYSVIPC_SYSCTL        -e POSIX_MQUEUE \
             -e POSIX_MQUEUE_SYSCTL -e NAMESPACES            -e UTS_NS \
@@ -66,7 +67,7 @@ jobs:
             -e NETFILTER_XT_SET    -e CGROUPS \
             -d IKHEADERS -d UAPI_HEADER_TEST -d LOCALVERSION_AUTO
           make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 \
-            CROSS_COMPILE=aarch64-linux-gnu- DISABLE_WRAPPER=1 olddefconfig
+            CROSS_COMPILE=aarch64-linux-gnu- DISABLE_WRAPPER=1 LOCALVERSION=-qgki-perf olddefconfig
           echo '=== 必需配置核验(任意一项缺失则终止) ==='
           fail=0
           for c in SYSVIPC POSIX_MQUEUE IPC_NS PID_NS USER_NS NET_NS \
@@ -85,8 +86,9 @@ jobs:
           KCFLAGS: -D__ANDROID_COMMON_KERNEL__
         run: |
           export PATH="/usr/lib/llvm-14/bin:$PATH"
+export LOCALVERSION=-qgki-perf
           make -j"$(nproc)" O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 \
-            CROSS_COMPILE=aarch64-linux-gnu- DISABLE_WRAPPER=1 Image.gz
+            CROSS_COMPILE=aarch64-linux-gnu- DISABLE_WRAPPER=1 LOCALVERSION=-qgki-perf Image.gz
 
       - name: Verify vermagic must equal stock (5.4.210-qgki-perf)
         working-directory: kernel
