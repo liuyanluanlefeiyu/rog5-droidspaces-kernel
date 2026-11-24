@@ -39,13 +39,15 @@ jobs:
             cpio kmod zip zstd python3 curl \
             gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
 
-      - name: Add swap (ThinLTO link needs headroom)
+      - name: Add swap if possible (best effort, non-fatal)
+        continue-on-error: true
         run: |
-          sudo fallocate -l 8G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=8192
-          sudo chmod 600 /swapfile
-          sudo mkswap /swapfile
-          sudo swapon /swapfile
+          ( sudo fallocate -l 8G /swapfile \
+            && sudo chmod 600 /swapfile \
+            && sudo mkswap /swapfile \
+            && sudo swapon /swapfile ) || echo 'swap not available, continuing without it'
           free -h
+          nproc
 
       - name: Fetch AOSP clang 11.0.2 (r383902b) - the exact stock toolchain
         run: |
