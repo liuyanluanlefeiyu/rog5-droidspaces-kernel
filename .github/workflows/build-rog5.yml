@@ -91,10 +91,14 @@ jobs:
       - name: Verify vermagic must equal stock (5.4.210-qgki-perf)
         working-directory: kernel
         run: |
-          banner=$(zgrep -a -m1 'Linux version' out/arch/arm64/boot/Image.gz || true)
-          echo "$banner"
-          echo "$banner" | grep -q '5\.4\.210-qgki-perf' \
-            || { echo '内核版本串与原厂不一致! 继续刷入会导致原厂模块全部加载失败, 终止'; exit 1; }
+          ls -lh out/arch/arm64/boot/Image.gz
+          ver=$(sed -n 's/^#define UTS_RELEASE "\(.*\)"/\1/p' out/include/generated/utsrelease.h)
+          echo "UTS_RELEASE = $ver"
+          if [ "$ver" != "5.4.210-qgki-perf" ]; then
+            echo '内核版本串与原厂不一致! 继续刷入会导致原厂模块全部加载失败, 终止'
+            exit 1
+          fi
+          echo 'vermagic 与原厂完全一致, 可以刷入'
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
