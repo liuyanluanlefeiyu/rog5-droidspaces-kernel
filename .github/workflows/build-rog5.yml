@@ -1,15 +1,38 @@
 name: Build ROG5 DroidSpaces kernel
 
-# 用法: 本文件放在仓库的 .github/workflows/build-rog5.yml
-# 仓库根目录同时放: 0001-rog5-sysvipc-kabi.patch / 0002-rog5-posix-mqueue-kabi.patch / droidspaces.config
-# 在 GitHub 网页 -> Actions -> Build ROG5 DroidSpaces kernel -> Run workflow 手动触发
+# Two kernels per run:
+#   - full-fixed: DroidSpaces options + KABI patches, with RELR / STACKPROTECTOR_PER_TASK
+#                 / TOOLS_SUPPORT_RELR / BUILD_ARM64_DT_OVERLAY disabled (stock-binary match)
+#   - baseline  : pristine tree, no patches, no extra options (bisect reference)
+# Both pin UTS_RELEASE to 5.4.210-qgki-perf so stock modules keep loading.
 
 on:
   workflow_dispatch:
+    inputs:
+      build_full:
+        description: 'Build full-fixed kernel'
+        default: true
+        type: boolean
+      build_baseline:
+        description: 'Build baseline kernel'
+        default: true
+        type: boolean
 
 jobs:
   build:
     runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - kernel_kind: full-fixed
+            artifact: rog5-fullfixed
+            enabled: ${{ inputs.build_full }}
+          - kernel_kind: baseline
+            artifact: rog5-baseline
+            enabled: ${{ inputs.build_baseline }}
+    name: kernel (${{ matrix.kernel_kind }})
+    if: ${{ matrix.enabled }}
     steps:
       - name: Checkout this package
         uses: actions/checkout@v4
@@ -28,24 +51,24 @@ jobs:
           git clone --depth=1 -b lineage-20 \
             https://github.com/alfaonyt/android_kernel_asus_sm8350 kernel
 
-      - name: Apply DroidSpaces KABI patches and commit
-        # 提交补丁后工作树干净, kbuild 不会给版本串追加 "+" 后缀
+      - name: Apply DroidSpaces KABI patches (full-fixed only)
+        if: matrix.kernel_kind == 'full-fixed'
         working-directory: kernel
         run: |
           git apply --check -v "$GITHUB_WORKSPACE/0001-rog5-sysvipc-kabi.patch"
           git apply        "$GITHUB_WORKSPACE/0001-rog5-sysvipc-kabi.patch"
           git apply --check -v "$GITHUB_WORKSPACE/0002-rog5-posix-mqueue-kabi.patch"
           git apply        "$GITHUB_WORKSPACE/0002-rog5-posix-mqueue-kabi.patch"
-          echo '=== 补丁落点核验 ==='
+          echo '=== patch land verification ==='
           grep -n 'ANDROID_KABI_USE(6' include/linux/sched.h
           grep -n 'ANDROID_KABI_USE(1' include/linux/sched/user.h
           git config user.email ci@local
           git config user.name ci
           git commit -am 'apply DroidSpaces KABI patches'
-          echo '=== 工作树状态(应为空) ==='
+          echo '=== tree status (should be empty) ==='
           git status --porcelain
 
-      - name: Configure (anakin_defconfig + DroidSpaces options)
+      - name: Configure
         working-directory: kernel
         env:
           KCFLAGS: -D__ANDROID_COMMON_KERNEL__
@@ -54,37 +77,57 @@ jobs:
           touch .scmversion
           make O=../out ARCH=arm64 LLVM=1 LLVM_IAS=1 \
             CROSS_COMPILE=aarch64-linux-gnu- DISABLE_WRAPPER=1 vendor/anakin_defconfig
+
+          if [ "${{ matrix.kernel_kind }}" = "full-fixed" ]; then
+            ./scripts/config --file ../out/.config \
+              -e SYSVIPC             -e SYSVIPC_SYSCTL        -e POSIX_MQUEUE \
+              -e POSIX_MQUEUE_SYSCTL -e NAMESPACES            -e UTS_NS \
+              -e IPC_NS              -e USER_NS               -e PID_NS \
+              -e NET_NS              -e DEVTMPFS              -e DEVTMPFS_MOUNT \
+              -e CGROUP_DEVICE       -e CGROUP_PIDS           -e CFS_BANDWIDTH \
+              -e MEMCG               -e TMPFS_XATTR           -e TMPFS_POSIX_ACL \
+              -e OVERLAY_FS          -e VETH                  -e BRIDGE \
+              -e BRIDGE_NETFILTER    -e NETFILTER_ADVANCED \
+              -e NETFILTER_XT_MATCH_ADDRTYPE \
+              -e NETFILTER_XT_TARGET_REJECT \
+              -e NETFILTER_XT_TARGET_LOG \
+              -e NETFILTER_XT_MATCH_RECENT \
+              -e NETFILTER_XT_MATCH_COMMENT \
+              -e IP_NF_NAT           -e IP_NF_TARGET_MASQUERADE \
+              -e IP_SET              -e IP_SET_HASH_IP        -e IP_SET_HASH_NET \
+              -e NETFILTER_XT_SET    -e CGROUPS
+            echo '=== full-fixed: container options enabled ==='
+          else
+            echo '=== baseline: pristine config, no modifications ==='
+          fi
+
+          # Binary/ABI level options that the stock (AOSP clang-11 r383902b) kernel does NOT have.
+          # Newer toolchains auto-enable them; forced off in BOTH variants for stock-like image.
           ./scripts/config --file ../out/.config \
-            -e SYSVIPC             -e SYSVIPC_SYSCTL        -e POSIX_MQUEUE \
-            -e POSIX_MQUEUE_SYSCTL -e NAMESPACES            -e UTS_NS \
-            -e IPC_NS              -e USER_NS               -e PID_NS \
-            -e NET_NS              -e DEVTMPFS              -e DEVTMPFS_MOUNT \
-            -e CGROUP_DEVICE       -e CGROUP_PIDS           -e CFS_BANDWIDTH \
-            -e MEMCG               -e TMPFS_XATTR           -e TMPFS_POSIX_ACL \
-            -e OVERLAY_FS          -e VETH                  -e BRIDGE \
-            -e BRIDGE_NETFILTER    -e NETFILTER_ADVANCED \
-            -e NETFILTER_XT_MATCH_ADDRTYPE \
-            -e NETFILTER_XT_TARGET_REJECT \
-            -e NETFILTER_XT_TARGET_LOG \
-            -e NETFILTER_XT_MATCH_RECENT \
-            -e NETFILTER_XT_MATCH_COMMENT \
-            -e IP_NF_NAT           -e IP_NF_TARGET_MASQUERADE \
-            -e IP_SET              -e IP_SET_HASH_IP        -e IP_SET_HASH_NET \
-            -e NETFILTER_XT_SET    -e CGROUPS \
+            -d RELR -d TOOLS_SUPPORT_RELR \
+            -d STACKPROTECTOR_PER_TASK \
+            -d BUILD_ARM64_DT_OVERLAY \
             -d IKHEADERS -d UAPI_HEADER_TEST -d LOCALVERSION_AUTO
+
           make O=../out ARCH=arm64 LLVM=1 LLVM_IAS=1 \
             CROSS_COMPILE=aarch64-linux-gnu- DISABLE_WRAPPER=1 olddefconfig
-          echo '=== 必需配置核验(任意一项缺失则终止) ==='
-          fail=0
-          for c in SYSVIPC POSIX_MQUEUE IPC_NS PID_NS USER_NS NET_NS \
-                   DEVTMPFS CGROUP_DEVICE CGROUP_PIDS TMPFS_XATTR; do
-            if grep -q "^CONFIG_${c}=y" ../out/.config; then
-              echo "  [OK]   CONFIG_${c}=y"
-            else
-              echo "  [MISS] CONFIG_${c}"; fail=1
-            fi
-          done
-          [ $fail -eq 0 ] || { echo '存在缺失配置,终止'; exit 1; }
+
+          echo '=== verify forced-off options (expect all "is not set" or absent) ==='
+          grep -E 'CONFIG_RELR|TOOLS_SUPPORT_RELR|STACKPROTECTOR_PER_TASK|BUILD_ARM64_DT_OVERLAY' ../out/.config || echo '  none enabled - good'
+
+          if [ "${{ matrix.kernel_kind }}" = "full-fixed" ]; then
+            echo '=== required container options check ==='
+            fail=0
+            for c in SYSVIPC POSIX_MQUEUE IPC_NS PID_NS USER_NS NET_NS \
+                     DEVTMPFS CGROUP_DEVICE CGROUP_PIDS TMPFS_XATTR; do
+              if grep -q "^CONFIG_${c}=y" ../out/.config; then
+                echo "  [OK]   CONFIG_${c}=y"
+              else
+                echo "  [MISS] CONFIG_${c}"; fail=1
+              fi
+            done
+            [ $fail -eq 0 ] || { echo 'missing required options, abort'; exit 1; }
+          fi
 
       - name: Build kernel Image
         working-directory: kernel
@@ -95,24 +138,27 @@ jobs:
           make -j"$(nproc)" O=../out ARCH=arm64 LLVM=1 LLVM_IAS=1 \
             CROSS_COMPILE=aarch64-linux-gnu- DISABLE_WRAPPER=1 Image.gz
 
-      - name: Verify vermagic must equal stock (5.4.210-qgki-perf)
+      - name: Prepare artifacts (raw Image + gz + config)
         working-directory: kernel
         run: |
           ls -lh ../out/arch/arm64/boot/Image.gz
+          cp ../out/arch/arm64/boot/Image.gz ../out/Image.gz
+          gzip -dc ../out/arch/arm64/boot/Image.gz > ../out/Image
+          cp ../out/.config ../out/kernel.config
           ver=$(sed -n 's/^#define UTS_RELEASE "\(.*\)"/\1/p' ../out/include/generated/utsrelease.h)
           echo "UTS_RELEASE = $ver"
           if [ "$ver" != "5.4.210-qgki-perf" ]; then
-            echo '内核版本串与原厂不一致! 继续刷入会导致原厂模块全部加载失败, 终止'
-            exit 1
+            echo 'vermagic mismatch! abort'; exit 1
           fi
-          echo 'vermagic 与原厂完全一致, 可以刷入'
+          echo 'vermagic exact match with stock'
 
       - name: Upload artifacts
-        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: rog5-droidspaces-kernel
+          name: ${{ matrix.artifact }}
           path: |
-            out/arch/arm64/boot/Image.gz
-            out/.config
+            out/Image.gz
+            out/Image
+            out/kernel.config
           if-no-files-found: error
+          include-hidden-files: true
