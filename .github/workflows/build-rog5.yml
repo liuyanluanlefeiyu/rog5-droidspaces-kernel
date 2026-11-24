@@ -8,15 +8,6 @@ name: Build ROG5 DroidSpaces kernel
 
 on:
   workflow_dispatch:
-    inputs:
-      build_full:
-        description: 'Build full-fixed kernel'
-        default: true
-        type: boolean
-      build_baseline:
-        description: 'Build baseline kernel'
-        default: true
-        type: boolean
 
 jobs:
   build:
@@ -27,12 +18,9 @@ jobs:
         include:
           - kernel_kind: full-fixed
             artifact: rog5-fullfixed
-            enabled: ${{ inputs.build_full }}
           - kernel_kind: baseline
             artifact: rog5-baseline
-            enabled: ${{ inputs.build_baseline }}
     name: kernel (${{ matrix.kernel_kind }})
-    if: ${{ matrix.enabled }}
     steps:
       - name: Checkout this package
         uses: actions/checkout@v4
