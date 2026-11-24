@@ -111,7 +111,10 @@ jobs:
 
           echo '=== replace defconfig with stock kernel config ==='
           cp "$GITHUB_WORKSPACE/stock.config" ../out/.config
-          ./scripts/config --file ../out/.config -d LOCALVERSION_AUTO
+          # LOCALVERSION_AUTO: keep the UTS release pinned to 5.4.210-qgki-perf
+          # RELR: stock config has no RELR at all (ASUS tree predates it);
+          #       our tree auto-enables it, which shrinks the image ~4.5 MB.
+          ./scripts/config --file ../out/.config -d LOCALVERSION_AUTO -d RELR
 
           if [ "${{ matrix.kernel_kind }}" = "full11" ]; then
             ./scripts/config --file ../out/.config \
@@ -140,6 +143,8 @@ jobs:
           grep -E '^CONFIG_(CC_VERSION_TEXT|CLANG_VERSION|LD_IS_LLD|LD_VERSION|LTO|LTO_CLANG|THINLTO|CFI_CLANG|STACKPROTECTOR)' ../out/.config || true
           echo '=== stack protector sysreg / per-task (stock has neither) ==='
           grep -E 'STACKPROTECTOR_PER_TASK|CC_HAVE_STACKPROTECTOR_SYSREG' ../out/.config || echo '  absent - matches stock'
+          echo '=== RELR (stock lacks it) ==='
+          grep -E '^CONFIG_RELR' ../out/.config || echo '  RELR not set - matches stock'
 
           echo '=== config diff vs stock (for the record) ==='
           diff -u "$GITHUB_WORKSPACE/stock.config" ../out/.config > ../out/config-vs-stock.diff || true
