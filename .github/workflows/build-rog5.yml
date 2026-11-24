@@ -63,7 +63,8 @@ jobs:
             -e NETFILTER_XT_MATCH_COMMENT \
             -e IP_NF_NAT           -e IP_NF_TARGET_MASQUERADE \
             -e IP_SET              -e IP_SET_HASH_IP        -e IP_SET_HASH_NET \
-            -e NETFILTER_XT_SET    -e CGROUPS
+            -e NETFILTER_XT_SET    -e CGROUPS \
+            -d IKHEADERS
           make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 \
             CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
           echo '=== 必需配置核验(任意一项缺失则终止) ==='
