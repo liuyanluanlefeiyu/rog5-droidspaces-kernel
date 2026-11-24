@@ -45,7 +45,7 @@ jobs:
           KCFLAGS: -D__ANDROID_COMMON_KERNEL__
         run: |
           export PATH="/usr/lib/llvm-14/bin:$PATH"
-export LOCALVERSION=-qgki-perf
+          export LOCALVERSION=-qgki-perf
           make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 \
             CROSS_COMPILE=aarch64-linux-gnu- DISABLE_WRAPPER=1 LOCALVERSION=-qgki-perf vendor/anakin_defconfig
           ./scripts/config --file out/.config \
@@ -86,7 +86,7 @@ export LOCALVERSION=-qgki-perf
           KCFLAGS: -D__ANDROID_COMMON_KERNEL__
         run: |
           export PATH="/usr/lib/llvm-14/bin:$PATH"
-export LOCALVERSION=-qgki-perf
+          export LOCALVERSION=-qgki-perf
           make -j"$(nproc)" O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 \
             CROSS_COMPILE=aarch64-linux-gnu- DISABLE_WRAPPER=1 LOCALVERSION=-qgki-perf Image.gz
 
