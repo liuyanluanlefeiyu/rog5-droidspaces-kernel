@@ -1,0 +1,105 @@
+name: Build ROG5 DroidSpaces kernel
+
+# 用法: 把本文件放到你新建仓库的 .github/workflows/ 目录(去掉多余目录层级)
+# 仓库根目录同时放: 0001-rog5-sysvipc-kabi.patch / 0002-rog5-posix-mqueue-kabi.patch / droidspaces.config
+# 然后在 GitHub 网页 -> Actions -> Build ROG5 DroidSpaces kernel -> Run workflow 手动触发
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout this package
+        uses: actions/checkout@v4
+
+      - name: Install toolchain and dependencies
+        run: |
+          sudo apt-get -qq update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bc bison flex libssl-dev libelf-dev \
+            cpio kmod zip zstd python3 \
+            clang-14 lld-14 llvm-14 \
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+
+      - name: Clone ROG5 kernel (lineage-20 = 5.4.210-qgki-perf, QSSI13.0)
+        run: |
+          git clone --depth=1 -b lineage-20 \
+            https://github.com/alfaonyt/android_kernel_asus_sm8350 kernel
+
+      - name: Apply DroidSpaces KABI patches
+        working-directory: kernel
+        run: |
+          git apply --check -v "$GITHUB_WORKSPACE/0001-rog5-sysvipc-kabi.patch"
+          git apply        "$GITHUB_WORKSPACE/0001-rog5-sysvipc-kabi.patch"
+          git apply --check -v "$GITHUB_WORKSPACE/0002-rog5-posix-mqueue-kabi.patch"
+          git apply        "$GITHUB_WORKSPACE/0002-rog5-posix-mqueue-kabi.patch"
+          echo '=== 补丁落点核验 ==='
+          grep -n 'ANDROID_KABI_USE(6' include/linux/sched.h
+          grep -n 'ANDROID_KABI_USE(1' include/linux/sched/user.h
+
+      - name: Configure (anakin_defconfig + DroidSpaces options)
+        working-directory: kernel
+        env:
+          KCFLAGS: -D__ANDROID_COMMON_KERNEL__
+        run: |
+          export PATH="/usr/lib/llvm-14/bin:$PATH"
+          make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 \
+            CROSS_COMPILE=aarch64-linux-gnu- vendor/anakin_defconfig
+          ./scripts/config --file out/.config \
+            -e SYSVIPC             -e SYSVIPC_SYSCTL        -e POSIX_MQUEUE \
+            -e POSIX_MQUEUE_SYSCTL -e NAMESPACES            -e UTS_NS \
+            -e IPC_NS              -e USER_NS               -e PID_NS \
+            -e NET_NS              -e DEVTMPFS              -e DEVTMPFS_MOUNT \
+            -e CGROUP_DEVICE       -e CGROUP_PIDS           -e CFS_BANDWIDTH \
+            -e MEMCG               -e TMPFS_XATTR           -e TMPFS_POSIX_ACL \
+            -e OVERLAY_FS          -e VETH                  -e BRIDGE \
+            -e BRIDGE_NETFILTER    -e NETFILTER_ADVANCED \
+            -e NETFILTER_XT_MATCH_ADDRTYPE \
+            -e NETFILTER_XT_TARGET_REJECT \
+            -e NETFILTER_XT_TARGET_LOG \
+            -e NETFILTER_XT_MATCH_RECENT \
+            -e NETFILTER_XT_MATCH_COMMENT \
+            -e IP_NF_NAT           -e IP_NF_TARGET_MASQUERADE \
+            -e IP_SET              -e IP_SET_HASH_IP        -e IP_SET_HASH_NET \
+            -e NETFILTER_XT_SET    -e CGROUPS
+          make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 \
+            CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
+          echo '=== 必需配置核验(任意一项缺失则终止) ==='
+          fail=0
+          for c in SYSVIPC POSIX_MQUEUE IPC_NS PID_NS USER_NS NET_NS \
+                   DEVTMPFS CGROUP_DEVICE CGROUP_PIDS TMPFS_XATTR; do
+            if grep -q "^CONFIG_${c}=y" out/.config; then
+              echo "  [OK]   CONFIG_${c}=y"
+            else
+              echo "  [MISS] CONFIG_${c}"; fail=1
+            fi
+          done
+          [ $fail -eq 0 ] || { echo '存在缺失配置,终止'; exit 1; }
+
+      - name: Build kernel Image
+        working-directory: kernel
+        env:
+          KCFLAGS: -D__ANDROID_COMMON_KERNEL__
+        run: |
+          export PATH="/usr/lib/llvm-14/bin:$PATH"
+          make -j"$(nproc)" O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 \
+            CROSS_COMPILE=aarch64-linux-gnu- Image.gz
+
+      - name: Verify vermagic must equal stock (5.4.210-qgki-perf)
+        working-directory: kernel
+        run: |
+          banner=$(zgrep -a -m1 'Linux version' out/arch/arm64/boot/Image.gz || true)
+          echo "$banner"
+          echo "$banner" | grep -q '5\.4\.210-qgki-perf' \
+            || { echo '内核版本串与原厂不一致! 继续刷入会导致原厂模块全部加载失败, 终止'; exit 1; }
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: rog5-droidspaces-kernel
+          path: |
+            kernel/out/arch/arm64/boot/Image.gz
+            kernel/out/.config
+          if-no-files-found: error
