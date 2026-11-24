@@ -1,0 +1,182 @@
+name: Build ROG5 kernel (stock clang-11 toolchain)
+
+# Round 12 experiment. Two decisive variants, both toolchain-aligned with the
+# stock ASUS kernel (AOSP clang 11.0.2, r383902b) and both configured from the
+# config extracted out of the stock kernel itself (.config via IKCONFIG).
+#
+#   stock11 : pure stock config, no patches  -> "does our tree+toolchain reproduce a bootable kernel?"
+#   full11  : stock config + DroidSpaces KABI patches + container options
+#
+# Rationale: stock GKI 5.4 kernel is built with CFI_CLANG + ThinLTO. CFI type
+# hashes and stack-protector codegen are toolchain-version dependent; a clang-14
+# build cannot be CFI/ABI compatible with stock vendor modules. Hence clang-11.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - kernel_kind: stock11
+            artifact: rog5-stock11
+          - kernel_kind: full11
+            artifact: rog5-full11
+    name: kernel (${{ matrix.kernel_kind }})
+    steps:
+      - name: Checkout this package
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get -qq update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bc bison flex libssl-dev libelf-dev \
+            cpio kmod zip zstd python3 curl \
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+
+      - name: Add swap (ThinLTO link needs headroom)
+        run: |
+          sudo fallocate -l 8G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=8192
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          free -h
+
+      - name: Fetch AOSP clang 11.0.2 (r383902b) - the exact stock toolchain
+        run: |
+          set -euo pipefail
+          base=https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive
+          ok=0
+          for ref in refs/heads/android11-release refs/heads/android11-gsi refs/heads/android-11.0.0_r1; do
+            echo "trying $ref"
+            if curl -fsSL --retry 2 --connect-timeout 20 --max-time 600 \
+                 -o /tmp/clang.tar.gz "$base/$ref/clang-r383902b.tar.gz"; then
+              echo "downloaded from $ref"
+              ok=1
+              break
+            fi
+          done
+          if [ "$ok" -ne 1 ]; then
+            echo 'FATAL: could not fetch official clang prebuilt'
+            exit 1
+          fi
+          ls -lh /tmp/clang.tar.gz
+          mkdir -p "$HOME/clang11"
+          tar xf /tmp/clang.tar.gz -C "$HOME/clang11"
+          echo "$HOME/clang11/bin" >> "$GITHUB_PATH"
+          "$HOME/clang11/bin/clang" --version
+          "$HOME/clang11/bin/clang" --version | grep -q 'clang version 11\.0\.2'
+          echo 'clang 11.0.2 OK'
+          for t in ld.lld llvm-ar llvm-nm llvm-objcopy llvm-strip llvm-objdump; do
+            test -x "$HOME/clang11/bin/$t" && echo "  [OK] $t" || echo "  [MISS] $t"
+          done
+
+      - name: Clone ROG5 kernel (lineage-20 = 5.4.210-qgki-perf, QSSI13.0)
+        run: |
+          git clone --depth=1 -b lineage-20 \
+            https://github.com/alfaonyt/android_kernel_asus_sm8350 kernel
+
+      - name: Apply DroidSpaces KABI patches (full11 only)
+        if: matrix.kernel_kind == 'full11'
+        working-directory: kernel
+        run: |
+          git apply --check -v "$GITHUB_WORKSPACE/0001-rog5-sysvipc-kabi.patch"
+          git apply        "$GITHUB_WORKSPACE/0001-rog5-sysvipc-kabi.patch"
+          git apply --check -v "$GITHUB_WORKSPACE/0002-rog5-posix-mqueue-kabi.patch"
+          git apply        "$GITHUB_WORKSPACE/0002-rog5-posix-mqueue-kabi.patch"
+          grep -n 'ANDROID_KABI_USE(6' include/linux/sched.h
+          grep -n 'ANDROID_KABI_USE(1' include/linux/sched/user.h
+          git config user.email ci@local
+          git config user.name ci
+          git commit -am 'apply DroidSpaces KABI patches'
+          git status --porcelain
+
+      - name: Configure from stock config
+        working-directory: kernel
+        env:
+          KCFLAGS: -D__ANDROID_COMMON_KERNEL__
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/clang11/bin:$PATH"
+          touch .scmversion
+          make O=../out ARCH=arm64 LLVM=1 LLVM_IAS=1 \
+            CROSS_COMPILE=aarch64-linux-gnu- DISABLE_WRAPPER=1 vendor/anakin_defconfig
+
+          echo '=== replace defconfig with stock kernel config ==='
+          cp "$GITHUB_WORKSPACE/stock.config" ../out/.config
+          ./scripts/config --file ../out/.config -d LOCALVERSION_AUTO
+
+          if [ "${{ matrix.kernel_kind }}" = "full11" ]; then
+            ./scripts/config --file ../out/.config \
+              -e SYSVIPC             -e SYSVIPC_SYSCTL        -e POSIX_MQUEUE \
+              -e POSIX_MQUEUE_SYSCTL -e NAMESPACES            -e UTS_NS \
+              -e IPC_NS              -e USER_NS               -e PID_NS \
+              -e NET_NS              -e DEVTMPFS              -e DEVTMPFS_MOUNT \
+              -e CGROUP_DEVICE       -e CGROUP_PIDS           -e CFS_BANDWIDTH \
+              -e MEMCG               -e TMPFS_XATTR           -e TMPFS_POSIX_ACL \
+              -e OVERLAY_FS          -e VETH                  -e BRIDGE \
+              -e BRIDGE_NETFILTER    -e NETFILTER_ADVANCED \
+              -e NETFILTER_XT_MATCH_ADDRTYPE \
+              -e NETFILTER_XT_TARGET_REJECT \
+              -e NETFILTER_XT_TARGET_LOG \
+              -e NETFILTER_XT_MATCH_RECENT \
+              -e NETFILTER_XT_MATCH_COMMENT \
+              -e IP_NF_NAT           -e IP_NF_TARGET_MASQUERADE \
+              -e IP_SET              -e IP_SET_HASH_IP        -e IP_SET_HASH_NET \
+              -e NETFILTER_XT_SET    -e CGROUPS
+          fi
+
+          make O=../out ARCH=arm64 LLVM=1 LLVM_IAS=1 \
+            CROSS_COMPILE=aarch64-linux-gnu- DISABLE_WRAPPER=1 olddefconfig
+
+          echo '=== toolchain identity in generated config ==='
+          grep -E '^CONFIG_(CC_VERSION_TEXT|CLANG_VERSION|LD_IS_LLD|LD_VERSION|LTO|LTO_CLANG|THINLTO|CFI_CLANG|STACKPROTECTOR)' ../out/.config || true
+          echo '=== stack protector sysreg / per-task (stock has neither) ==='
+          grep -E 'STACKPROTECTOR_PER_TASK|CC_HAVE_STACKPROTECTOR_SYSREG' ../out/.config || echo '  absent - matches stock'
+
+          echo '=== config diff vs stock (for the record) ==='
+          diff -u "$GITHUB_WORKSPACE/stock.config" ../out/.config > ../out/config-vs-stock.diff || true
+          changed=$(grep -cE '^[+-]CONFIG' ../out/config-vs-stock.diff || true)
+          echo "changed CONFIG lines: $changed"
+          grep -E '^\+CONFIG' ../out/config-vs-stock.diff | head -60 || true
+
+      - name: Build kernel Image.gz
+        working-directory: kernel
+        env:
+          KCFLAGS: -D__ANDROID_COMMON_KERNEL__
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/clang11/bin:$PATH"
+          make -j"$(nproc)" O=../out ARCH=arm64 LLVM=1 LLVM_IAS=1 \
+            CROSS_COMPILE=aarch64-linux-gnu- DISABLE_WRAPPER=1 Image.gz
+
+      - name: Prepare artifacts and verify vermagic
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+          ls -lh ../out/arch/arm64/boot/Image.gz
+          cp ../out/arch/arm64/boot/Image.gz ../out/Image.gz
+          gzip -dc ../out/arch/arm64/boot/Image.gz > ../out/Image
+          cp ../out/.config ../out/kernel.config
+          ver=$(sed -n 's/^#define UTS_RELEASE "\(.*\)"/\1/p' ../out/include/generated/utsrelease.h)
+          echo "UTS_RELEASE = $ver"
+          [ "$ver" = "5.4.210-qgki-perf" ] || { echo 'vermagic mismatch! abort'; exit 1; }
+          echo 'vermagic exact match with stock'
+          sha256sum ../out/Image ../out/Image.gz
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            out/Image.gz
+            out/Image
+            out/kernel.config
+            out/config-vs-stock.diff
+          if-no-files-found: error
+          include-hidden-files: true
