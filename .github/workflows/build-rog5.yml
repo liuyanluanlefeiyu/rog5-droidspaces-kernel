@@ -51,6 +51,7 @@ jobs:
           KCFLAGS: -D__ANDROID_COMMON_KERNEL__
         run: |
           export PATH="/usr/lib/llvm-14/bin:$PATH"
+          touch .scmversion
           make O=../out ARCH=arm64 LLVM=1 LLVM_IAS=1 \
             CROSS_COMPILE=aarch64-linux-gnu- DISABLE_WRAPPER=1 vendor/anakin_defconfig
           ./scripts/config --file ../out/.config \
@@ -107,6 +108,7 @@ jobs:
           echo 'vermagic 与原厂完全一致, 可以刷入'
 
       - name: Upload artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: rog5-droidspaces-kernel
