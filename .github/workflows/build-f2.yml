@@ -1,0 +1,171 @@
+name: ROG5 f2 (f1 + MACVLAN + IPv6 NAT)
+
+# f1 boots and DroidSpaces runs containers (network + mounts OK). DroidSpaces only
+# reported optional gaps. Two of them are safe to add and useful:
+#   MACVLAN                 -> container --net=l (macvlan) mode
+#   IP6_NF_NAT (+MASQUERADE) -> IPv6 egress NAT inside containers
+# Stock already has IP6_NF_IPTABLES/FILTER/MANGLE/RAW/REJECT, so only the NAT
+# table is added. Two gaps stay unfixable (ABI): CGROUP_PIDS and CFS_BANDWIDTH.
+#
+# Boot-test matrix so far (stock clang-11 + stock .config):
+#   stock11                  OK
+#   v1-patchonly             (untested, superseded)
+#   v2-ipc   sysvipc+mq      OK   (with the IPC_NS it auto-selects)
+#   v3-ns    USER_NS/PID_NS  OK
+#   w2-tmpfs xattr/acl       OK
+#   x1-devtmpfs              OK
+#   w3-cgroups PIDS+DEVICE   FAIL  -> CGROUP_SUBSYS_COUNT grows -> struct cgroup grows
+#   w4-netfilter bridge/ipset/xt FAIL
+#   v4 / v5 / full11          FAIL (they contain w3/w4)
+#
+# This build is the union of everything that boots on its own, dropping the two
+# ABI-breaking groups (cgroup pids/device controllers and the bridge/ipset/xt
+# netfilter extras). Container essentials already exist in the stock config:
+# CGROUPS, MEMCG, CPUSETS, CGROUP_FREEZER, CGROUP_BPF, VETH, BRIDGE,
+# OVERLAY_FS, full iptables NAT/MASQUERADE/conntrack, NETFILTER_ADVANCED.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - kind: f2-macvlan-ipv6nat
+            opts: 'SYSVIPC SYSVIPC_SYSCTL SYSVIPC_COMPAT POSIX_MQUEUE POSIX_MQUEUE_SYSCTL IPC_NS USER_NS PID_NS DEVTMPFS TMPFS_XATTR TMPFS_POSIX_ACL MACVLAN IP6_NF_NAT IP6_NF_TARGET_MASQUERADE'
+    name: kernel (${{ matrix.kind }})
+    steps:
+      - name: Checkout this package
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get -qq update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bc bison flex libssl-dev libelf-dev \
+            cpio kmod zip zstd python3 curl \
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+
+      - name: Fetch AOSP clang 11.0.2 (r383902b) - verified download with retries
+        run: |
+          set -euo pipefail
+          base=https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive
+          ok=0
+          for attempt in 1 2 3; do
+            for ref in refs/heads/android11-release refs/heads/android11-gsi refs/heads/android-11.0.0_r1; do
+              echo "attempt=$attempt ref=$ref"
+              rm -f /tmp/clang.tar.gz
+              if curl -fL --retry 5 --retry-all-errors --retry-delay 5 \
+                   --connect-timeout 30 -o /tmp/clang.tar.gz \
+                   "$base/$ref/clang-r383902b.tar.gz" \
+                 && tar tzf /tmp/clang.tar.gz > /dev/null 2>&1; then
+                echo "verified tarball from $ref"; ok=1; break 2
+              fi
+            done
+          done
+          [ "$ok" -eq 1 ] || { echo 'FATAL: clang download failed or archive corrupt'; exit 1; }
+          mkdir -p "$HOME/clang11"
+          tar xf /tmp/clang.tar.gz -C "$HOME/clang11"
+          echo "$HOME/clang11/bin" >> "$GITHUB_PATH"
+          "$HOME/clang11/bin/clang" --version | grep -q 'clang version 11\.0\.2'
+
+      - name: Clone ROG5 kernel (lineage-20 = 5.4.210-qgki-perf, QSSI13.0)
+        run: |
+          git clone --depth=1 -b lineage-20 \
+            https://github.com/alfaonyt/android_kernel_asus_sm8350 kernel
+
+      - name: Apply DroidSpaces KABI patches
+        working-directory: kernel
+        run: |
+          git apply --check -v "$GITHUB_WORKSPACE/0001-rog5-sysvipc-kabi.patch"
+          git apply        "$GITHUB_WORKSPACE/0001-rog5-sysvipc-kabi.patch"
+          git apply --check -v "$GITHUB_WORKSPACE/0002-rog5-posix-mqueue-kabi.patch"
+          git apply        "$GITHUB_WORKSPACE/0002-rog5-posix-mqueue-kabi.patch"
+          git config user.email ci@local
+          git config user.name ci
+          git commit -am 'apply DroidSpaces KABI patches'
+          git status --porcelain
+
+      - name: Configure from stock config
+        working-directory: kernel
+        env:
+          KCFLAGS: -D__ANDROID_COMMON_KERNEL__
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/clang11/bin:$PATH"
+          touch .scmversion
+          make O=../out ARCH=arm64 LLVM=1 LLVM_IAS=1 \
+            CROSS_COMPILE=aarch64-linux-gnu- DISABLE_WRAPPER=1 vendor/anakin_defconfig
+
+          cp "$GITHUB_WORKSPACE/stock.config" ../out/.config
+          ./scripts/config --file ../out/.config -d LOCALVERSION_AUTO -d RELR
+
+          opts='${{ matrix.opts }}'
+          args=''
+          for c in $opts; do args="$args -e $c"; done
+          # shellcheck disable=SC2086
+          ./scripts/config --file ../out/.config $args
+
+          make O=../out ARCH=arm64 LLVM=1 LLVM_IAS=1 \
+            CROSS_COMPILE=aarch64-linux-gnu- DISABLE_WRAPPER=1 olddefconfig
+
+          echo '=== effective delta vs stock ==='
+          diff -u "$GITHUB_WORKSPACE/stock.config" ../out/.config > ../out/config-vs-stock.diff || true
+          grep -E '^\+CONFIG|^-# CONFIG' ../out/config-vs-stock.diff || true
+
+          echo '=== forbidden ABI-breaking options must stay off ==='
+          for c in CGROUP_PIDS CGROUP_DEVICE BRIDGE_NETFILTER IP_SET FAIR_GROUP_SCHED CFS_BANDWIDTH; do
+            if grep -q "^CONFIG_${c}=y" ../out/.config; then
+              echo "  [BAD] $c is enabled"; exit 1
+            else
+              echo "  [ok]  $c off"
+            fi
+          done
+
+          echo '=== container capability check (stock + delta) ==='
+          for c in SYSVIPC POSIX_MQUEUE IPC_NS PID_NS USER_NS UTS_NS NET_NS \
+                   DEVTMPFS TMPFS_XATTR TMPFS_POSIX_ACL CGROUPS MEMCG CPUSETS \
+                   CGROUP_FREEZER CGROUP_BPF VETH BRIDGE OVERLAY_FS \
+                   NF_NAT IP_NF_NAT IP_NF_TARGET_MASQUERADE NETFILTER_XT_TARGET_MASQUERADE \
+                   MACVLAN IP6_NF_IPTABLES IP6_NF_NAT IP6_NF_TARGET_MASQUERADE; do
+            if grep -q "^CONFIG_${c}=y" ../out/.config; then echo "  [OK]   $c"; else echo "  [MISS] $c"; fi
+          done
+
+      - name: Build kernel Image.gz
+        working-directory: kernel
+        env:
+          KCFLAGS: -D__ANDROID_COMMON_KERNEL__
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/clang11/bin:$PATH"
+          make -j"$(nproc)" O=../out ARCH=arm64 LLVM=1 LLVM_IAS=1 \
+            CROSS_COMPILE=aarch64-linux-gnu- DISABLE_WRAPPER=1 Image.gz
+
+      - name: Prepare artifacts and verify vermagic
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+          gzip -dc ../out/arch/arm64/boot/Image.gz > ../out/Image
+          cp ../out/arch/arm64/boot/Image.gz ../out/Image.gz
+          cp ../out/.config ../out/kernel.config
+          ver=$(sed -n 's/^#define UTS_RELEASE "\(.*\)"/\1/p' ../out/include/generated/utsrelease.h)
+          echo "UTS_RELEASE = $ver"
+          [ "$ver" = "5.4.210-qgki-perf" ] || { echo 'vermagic mismatch! abort'; exit 1; }
+          ls -l ../out/Image
+          sha256sum ../out/Image
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: rog5-${{ matrix.kind }}
+          path: |
+            out/Image
+            out/Image.gz
+            out/kernel.config
+            out/config-vs-stock.diff
+          if-no-files-found: error
+          include-hidden-files: true
