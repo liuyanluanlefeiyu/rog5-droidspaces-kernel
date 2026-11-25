@@ -1,0 +1,95 @@
+name: Publish f2 kernel to Release
+
+# Downloads the already-built f2 artifact from run 45610672643 (no rebuild) and
+# publishes it as a GitHub Release so the image does not expire with artifacts.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Download f2 artifact from the build run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          curl -fL --retry 3 \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -o f2.zip \
+            "https://api.github.com/repos/${{ github.repository }}/actions/artifacts/15022093996/zip"
+          unzip -o f2.zip -d f2
+          ls -l f2
+
+      - name: Prepare release assets
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          cp f2/Image              out/Image-f2-macvlan-ipv6nat
+          cp f2/Image.gz           out/Image-f2-macvlan-ipv6nat.gz
+          cp f2/kernel.config      out/kernel-f2.config
+          cp f2/config-vs-stock.diff out/config-vs-stock-f2.diff
+          ( cd out && sha256sum Image-f2-macvlan-ipv6nat Image-f2-macvlan-ipv6nat.gz kernel-f2.config > SHA256SUMS.txt )
+          cat out/SHA256SUMS.txt
+
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG=f2-5.4.210-qgki-perf
+          cat > notes.md <<'EOF'
+          ## ROG5 容器内核 f2（5.4.210-qgki-perf）
+
+          **机型**：ASUS ROG Phone 5（anakin / ASUS_I005D / ZS673KS）
+          **固件基线**：WW_33.0210.0210.242（Android 13，QSSI13.0）
+          **源码树**：alfaonyt/android_kernel_asus_sm8350 @ lineage-20（LA.UM.9.14.r1-20800-LAHAINA.QSSI13.0）
+          **工具链**：AOSP clang 11.0.2（r383902b，与原厂内核完全同版）+ LTO_CLANG + CFI_CLANG
+          **配置基准**：从原厂内核 IKCONFIG 提取的完整 `.config`（仅 4 行差异）
+
+          ### 相对原厂内核新增
+          | 类别 | 选项 |
+          |---|---|
+          | IPC | `SYSVIPC`、`SYSVIPC_SYSCTL`、`SYSVIPC_COMPAT`、`POSIX_MQUEUE`、`POSIX_MQUEUE_SYSCTL` |
+          | 命名空间 | `IPC_NS`、`USER_NS`、`PID_NS`（`UTS_NS`/`NET_NS` 原厂已有） |
+          | 文件系统 | `DEVTMPFS`（不含 `DEVTMPFS_MOUNT`）、`TMPFS_XATTR`、`TMPFS_POSIX_ACL` |
+          | 网络 | `MACVLAN`、`IP6_NF_NAT`、`IP6_NF_TARGET_MASQUERADE` |
+
+          ### ABI 处理
+          `SYSVIPC` / `POSIX_MQUEUE` 新增的 `task_struct` / `user_struct` 字段被移入 Android KABI 预留槽
+          （`ANDROID_KABI_USE(6, ...)` / `ANDROID_KABI_USE(1, ...)`），`__GENKSYMS__` 路径下仍展开为原占位符，
+          因此导出符号 CRC 不变，原厂 vendor 模块可原样加载。实测 `disagrees about version of symbol` 计数为 **0**。
+
+          ### 未提供的能力（会破坏 vendor ABI，永久放弃）
+          - `CGROUP_PIDS`、`CGROUP_DEVICE`：`CGROUP_SUBSYS_COUNT` 是编译期常量，`struct cgroup` 内的
+            `subsys[]` / `e_csets[]` 数组随之变化，vendor 模块错位 → 卡开机。
+          - `CFS_BANDWIDTH`：依赖 `FAIR_GROUP_SCHED`，会改变调度器结构体布局。替代：`CPUSETS` 绑核。
+          - `BRIDGE_NETFILTER`、`IP_SET`：属冗余增强（原厂已具备完整 IPv4 NAT/MASQUERADE/conntrack），
+            启用后卡开机，一并放弃。
+
+          ### 已知提示（正常工作现象）
+          因 Android 兼容性矩阵要求 `CONFIG_SYSVIPC=n`（Google 安全策略），VINTF 校验会失败并弹
+          “您的设备内部出现了问题”。该提示仅表示配置策略不符，**不影响任何功能**，请忽略。
+
+          ### 刷入与回退
+          ```
+          # 用 APatch 重新修补 Image 后写入，或直接写打好包的 boot 镜像
+          fastboot flash boot new-boot.img
+
+          # 回退
+          fastboot flash boot boot_apatch_backup.img
+          ```
+          EOF
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" out/* --clobber
+          else
+            gh release create "$TAG" out/* \
+              --title "ROG5 容器内核 f2 (5.4.210-qgki-perf)" \
+              --notes-file notes.md
+          fi
+          gh release view "$TAG" --json assets --jq '.assets[] | "\(.name)  \(.size) bytes"'
