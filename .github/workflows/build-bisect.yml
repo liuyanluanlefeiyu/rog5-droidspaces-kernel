@@ -1,0 +1,168 @@
+name: ROG5 bisect (which option group breaks boot)
+
+# stock11 boots perfectly; full11 hangs at the static logo with an empty pstore.
+# So the tree + clang-11 + stock config are proven good, and exactly one of the
+# two KABI patches / the added container options is responsible.
+#
+# This run splits the delta into independent groups so one boot test each
+# pinpoints the culprit:
+#
+#   v1-patchonly : stock config + both KABI patches, no option changes
+#   v2-ipc       : + SYSVIPC / POSIX_MQUEUE family (patched into KABI slots)
+#   v3-ns        : + IPC_NS / USER_NS / PID_NS   (grows struct nsproxy)
+#   v4-rest      : + cgroups / devtmpfs / tmpfs / netfilter / ipset
+#   v5-nodevtmp  : full11 minus DEVTMPFS_MOUNT only
+#
+# All variants keep the stock clang-11 toolchain, stock .config base,
+# LOCALVERSION_AUTO and RELR off, and UTS_RELEASE pinned to 5.4.210-qgki-perf.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - kind: v1-patchonly
+            opts: ''
+          - kind: v2-ipc
+            opts: 'SYSVIPC SYSVIPC_SYSCTL SYSVIPC_COMPAT POSIX_MQUEUE POSIX_MQUEUE_SYSCTL'
+          - kind: v3-ns
+            opts: 'IPC_NS USER_NS PID_NS'
+          - kind: v4-rest
+            opts: 'CGROUP_PIDS CGROUP_DEVICE DEVTMPFS DEVTMPFS_MOUNT TMPFS_XATTR TMPFS_POSIX_ACL OVERLAY_FS VETH BRIDGE BRIDGE_NETFILTER NETFILTER_ADVANCED NETFILTER_XT_MATCH_ADDRTYPE NETFILTER_XT_TARGET_REJECT NETFILTER_XT_TARGET_LOG NETFILTER_XT_MATCH_RECENT NETFILTER_XT_MATCH_COMMENT IP_NF_NAT IP_NF_TARGET_MASQUERADE IP_SET IP_SET_HASH_IP IP_SET_HASH_NET NETFILTER_XT_SET'
+          - kind: v5-nodevtmp
+            opts: 'SYSVIPC SYSVIPC_SYSCTL SYSVIPC_COMPAT POSIX_MQUEUE POSIX_MQUEUE_SYSCTL IPC_NS USER_NS PID_NS CGROUP_PIDS CGROUP_DEVICE DEVTMPFS TMPFS_XATTR TMPFS_POSIX_ACL OVERLAY_FS VETH BRIDGE BRIDGE_NETFILTER NETFILTER_ADVANCED NETFILTER_XT_MATCH_ADDRTYPE NETFILTER_XT_TARGET_REJECT NETFILTER_XT_TARGET_LOG NETFILTER_XT_MATCH_RECENT NETFILTER_XT_MATCH_COMMENT IP_NF_NAT IP_NF_TARGET_MASQUERADE IP_SET IP_SET_HASH_IP IP_SET_HASH_NET NETFILTER_XT_SET'
+    name: kernel (${{ matrix.kind }})
+    steps:
+      - name: Checkout this package
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get -qq update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bc bison flex libssl-dev libelf-dev \
+            cpio kmod zip zstd python3 curl \
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+
+      - name: Add swap if possible (best effort, non-fatal)
+        continue-on-error: true
+        run: |
+          ( sudo fallocate -l 8G /swapfile \
+            && sudo chmod 600 /swapfile \
+            && sudo mkswap /swapfile \
+            && sudo swapon /swapfile ) || echo 'swap not available'
+          free -h
+
+      - name: Fetch AOSP clang 11.0.2 (r383902b) - the exact stock toolchain
+        run: |
+          set -euo pipefail
+          base=https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive
+          ok=0
+          for ref in refs/heads/android11-release refs/heads/android11-gsi refs/heads/android-11.0.0_r1; do
+            if curl -fsSL --retry 2 --connect-timeout 20 --max-time 600 \
+                 -o /tmp/clang.tar.gz "$base/$ref/clang-r383902b.tar.gz"; then
+              echo "downloaded from $ref"; ok=1; break
+            fi
+          done
+          [ "$ok" -eq 1 ] || { echo 'FATAL: clang download failed'; exit 1; }
+          mkdir -p "$HOME/clang11"
+          tar xf /tmp/clang.tar.gz -C "$HOME/clang11"
+          echo "$HOME/clang11/bin" >> "$GITHUB_PATH"
+          "$HOME/clang11/bin/clang" --version
+          "$HOME/clang11/bin/clang" --version | grep -q 'clang version 11\.0\.2'
+
+      - name: Clone ROG5 kernel (lineage-20 = 5.4.210-qgki-perf, QSSI13.0)
+        run: |
+          git clone --depth=1 -b lineage-20 \
+            https://github.com/alfaonyt/android_kernel_asus_sm8350 kernel
+
+      - name: Apply DroidSpaces KABI patches
+        working-directory: kernel
+        run: |
+          git apply --check -v "$GITHUB_WORKSPACE/0001-rog5-sysvipc-kabi.patch"
+          git apply        "$GITHUB_WORKSPACE/0001-rog5-sysvipc-kabi.patch"
+          git apply --check -v "$GITHUB_WORKSPACE/0002-rog5-posix-mqueue-kabi.patch"
+          git apply        "$GITHUB_WORKSPACE/0002-rog5-posix-mqueue-kabi.patch"
+          grep -n 'ANDROID_KABI_USE(6' include/linux/sched.h
+          grep -n 'ANDROID_KABI_USE(1' include/linux/sched/user.h
+          git config user.email ci@local
+          git config user.name ci
+          git commit -am 'apply DroidSpaces KABI patches'
+          git status --porcelain
+
+      - name: Configure from stock config
+        working-directory: kernel
+        env:
+          KCFLAGS: -D__ANDROID_COMMON_KERNEL__
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/clang11/bin:$PATH"
+          touch .scmversion
+          make O=../out ARCH=arm64 LLVM=1 LLVM_IAS=1 \
+            CROSS_COMPILE=aarch64-linux-gnu- DISABLE_WRAPPER=1 vendor/anakin_defconfig
+
+          cp "$GITHUB_WORKSPACE/stock.config" ../out/.config
+          ./scripts/config --file ../out/.config -d LOCALVERSION_AUTO -d RELR
+
+          opts='${{ matrix.opts }}'
+          if [ -n "$opts" ]; then
+            args=''
+            for c in $opts; do args="$args -e $c"; done
+            # shellcheck disable=SC2086
+            ./scripts/config --file ../out/.config $args
+            echo "requested: $opts"
+          else
+            echo 'requested: (none - pure stock config plus KABI patches)'
+          fi
+
+          make O=../out ARCH=arm64 LLVM=1 LLVM_IAS=1 \
+            CROSS_COMPILE=aarch64-linux-gnu- DISABLE_WRAPPER=1 olddefconfig
+
+          echo '=== effective delta vs stock ==='
+          diff -u "$GITHUB_WORKSPACE/stock.config" ../out/.config > ../out/config-vs-stock.diff || true
+          grep -E '^\+CONFIG|^-# CONFIG' ../out/config-vs-stock.diff || true
+          echo '=== sanity ==='
+          grep -E '^CONFIG_(CC_VERSION_TEXT|CLANG_VERSION|SYSVIPC|POSIX_MQUEUE|IPC_NS|USER_NS|PID_NS|DEVTMPFS)' ../out/.config || true
+          grep -E 'STACKPROTECTOR_PER_TASK|^CONFIG_RELR' ../out/.config || echo '  PER_TASK/RELR absent - matches stock'
+
+      - name: Build kernel Image.gz
+        working-directory: kernel
+        env:
+          KCFLAGS: -D__ANDROID_COMMON_KERNEL__
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/clang11/bin:$PATH"
+          make -j"$(nproc)" O=../out ARCH=arm64 LLVM=1 LLVM_IAS=1 \
+            CROSS_COMPILE=aarch64-linux-gnu- DISABLE_WRAPPER=1 Image.gz
+
+      - name: Prepare artifacts and verify vermagic
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+          gzip -dc ../out/arch/arm64/boot/Image.gz > ../out/Image
+          cp ../out/arch/arm64/boot/Image.gz ../out/Image.gz
+          cp ../out/.config ../out/kernel.config
+          ver=$(sed -n 's/^#define UTS_RELEASE "\(.*\)"/\1/p' ../out/include/generated/utsrelease.h)
+          echo "UTS_RELEASE = $ver"
+          [ "$ver" = "5.4.210-qgki-perf" ] || { echo 'vermagic mismatch! abort'; exit 1; }
+          ls -l ../out/Image
+          sha256sum ../out/Image
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: rog5-${{ matrix.kind }}
+          path: |
+            out/Image
+            out/Image.gz
+            out/kernel.config
+            out/config-vs-stock.diff
+            out/Module.symvers
+          if-no-files-found: error
+          include-hidden-files: true
