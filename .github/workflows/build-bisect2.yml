@@ -1,0 +1,150 @@
+name: ROG5 bisect round 2 (split the v4-rest group)
+
+# Round 1 results:
+#   stock11            boot OK
+#   v3-ns (USER/PID_NS) boot OK
+#   v4-rest            FAIL  (cgrouppids/device + devtmpfs+mount + tmpfs + netfilter/ipset)
+#   v5-nodevtmp        FAIL  (v4 minus DEVTMPFS_MOUNT, plus sysvipc + namespaces)
+#   v1 / v2            not tested yet
+#
+# v5 failing while v3 passes means either the rest of the v4 group (without the
+# devtmpfs auto-mount) or the SYSVIPC family is bad. v2-ipc already exists in run
+# 45561295198, so this run only splits the remaining v4 group into 4 pieces.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - kind: w1-devtmpfs
+            opts: 'DEVTMPFS DEVTMPFS_MOUNT'
+          - kind: w2-tmpfs
+            opts: 'TMPFS_XATTR TMPFS_POSIX_ACL'
+          - kind: w3-cgroups
+            opts: 'CGROUP_PIDS CGROUP_DEVICE'
+          - kind: w4-netfilter
+            opts: 'BRIDGE_NETFILTER NETFILTER_XT_SET NETFILTER_XT_MATCH_ADDRTYPE NETFILTER_XT_MATCH_RECENT IP_SET IP_SET_HASH_IP IP_SET_HASH_NET'
+    name: kernel (${{ matrix.kind }})
+    steps:
+      - name: Checkout this package
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get -qq update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bc bison flex libssl-dev libelf-dev \
+            cpio kmod zip zstd python3 curl \
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+
+      - name: Add swap if possible (best effort, non-fatal)
+        continue-on-error: true
+        run: |
+          ( sudo fallocate -l 8G /swapfile \
+            && sudo chmod 600 /swapfile \
+            && sudo mkswap /swapfile \
+            && sudo swapon /swapfile ) || echo 'swap not available'
+          free -h
+
+      - name: Fetch AOSP clang 11.0.2 (r383902b) - the exact stock toolchain
+        run: |
+          set -euo pipefail
+          base=https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive
+          ok=0
+          for ref in refs/heads/android11-release refs/heads/android11-gsi refs/heads/android-11.0.0_r1; do
+            if curl -fsSL --retry 2 --connect-timeout 20 --max-time 600 \
+                 -o /tmp/clang.tar.gz "$base/$ref/clang-r383902b.tar.gz"; then
+              echo "downloaded from $ref"; ok=1; break
+            fi
+          done
+          [ "$ok" -eq 1 ] || { echo 'FATAL: clang download failed'; exit 1; }
+          mkdir -p "$HOME/clang11"
+          tar xf /tmp/clang.tar.gz -C "$HOME/clang11"
+          echo "$HOME/clang11/bin" >> "$GITHUB_PATH"
+          "$HOME/clang11/bin/clang" --version | grep -q 'clang version 11\.0\.2'
+
+      - name: Clone ROG5 kernel (lineage-20 = 5.4.210-qgki-perf, QSSI13.0)
+        run: |
+          git clone --depth=1 -b lineage-20 \
+            https://github.com/alfaonyt/android_kernel_asus_sm8350 kernel
+
+      - name: Apply DroidSpaces KABI patches
+        working-directory: kernel
+        run: |
+          git apply --check -v "$GITHUB_WORKSPACE/0001-rog5-sysvipc-kabi.patch"
+          git apply        "$GITHUB_WORKSPACE/0001-rog5-sysvipc-kabi.patch"
+          git apply --check -v "$GITHUB_WORKSPACE/0002-rog5-posix-mqueue-kabi.patch"
+          git apply        "$GITHUB_WORKSPACE/0002-rog5-posix-mqueue-kabi.patch"
+          git config user.email ci@local
+          git config user.name ci
+          git commit -am 'apply DroidSpaces KABI patches'
+          git status --porcelain
+
+      - name: Configure from stock config
+        working-directory: kernel
+        env:
+          KCFLAGS: -D__ANDROID_COMMON_KERNEL__
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/clang11/bin:$PATH"
+          touch .scmversion
+          make O=../out ARCH=arm64 LLVM=1 LLVM_IAS=1 \
+            CROSS_COMPILE=aarch64-linux-gnu- DISABLE_WRAPPER=1 vendor/anakin_defconfig
+
+          cp "$GITHUB_WORKSPACE/stock.config" ../out/.config
+          ./scripts/config --file ../out/.config -d LOCALVERSION_AUTO -d RELR
+
+          opts='${{ matrix.opts }}'
+          args=''
+          for c in $opts; do args="$args -e $c"; done
+          # shellcheck disable=SC2086
+          ./scripts/config --file ../out/.config $args
+          echo "requested: $opts"
+
+          make O=../out ARCH=arm64 LLVM=1 LLVM_IAS=1 \
+            CROSS_COMPILE=aarch64-linux-gnu- DISABLE_WRAPPER=1 olddefconfig
+
+          echo '=== effective delta vs stock ==='
+          diff -u "$GITHUB_WORKSPACE/stock.config" ../out/.config > ../out/config-vs-stock.diff || true
+          grep -E '^\+CONFIG|^-# CONFIG' ../out/config-vs-stock.diff || true
+
+      - name: Build kernel Image.gz
+        working-directory: kernel
+        env:
+          KCFLAGS: -D__ANDROID_COMMON_KERNEL__
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/clang11/bin:$PATH"
+          make -j"$(nproc)" O=../out ARCH=arm64 LLVM=1 LLVM_IAS=1 \
+            CROSS_COMPILE=aarch64-linux-gnu- DISABLE_WRAPPER=1 Image.gz
+
+      - name: Prepare artifacts and verify vermagic
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+          gzip -dc ../out/arch/arm64/boot/Image.gz > ../out/Image
+          cp ../out/arch/arm64/boot/Image.gz ../out/Image.gz
+          cp ../out/.config ../out/kernel.config
+          ver=$(sed -n 's/^#define UTS_RELEASE "\(.*\)"/\1/p' ../out/include/generated/utsrelease.h)
+          echo "UTS_RELEASE = $ver"
+          [ "$ver" = "5.4.210-qgki-perf" ] || { echo 'vermagic mismatch! abort'; exit 1; }
+          ls -l ../out/Image
+          sha256sum ../out/Image
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: rog5-${{ matrix.kind }}
+          path: |
+            out/Image
+            out/Image.gz
+            out/kernel.config
+            out/config-vs-stock.diff
+          if-no-files-found: error
+          include-hidden-files: true
